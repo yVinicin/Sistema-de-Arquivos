@@ -72,17 +72,9 @@ Boot_Record fill_BT() {
 }
 
 // Função para preencher com zeros o restante do Boot Record
-void write_boot_record(FILE *img, Boot_Record bt) {
-    uint8_t buffer[512];
-
-    // Preenche todo o setor com zeros
-    memset(buffer, 0, 512);
-
-    // Copia o struct para o início do setor
-    memcpy(buffer, &bt, sizeof(Boot_Record));
-
-    // Escreve o setor no arquivo
-    fwrite(buffer, 1, 512, img);
+void write_boot_record(FILE *img, Boot_Record *bt) {
+    fseek(img, 0, SEEK_SET);
+    fwrite(bt, sizeof(Boot_Record), 1, img);
 }
 
 /*********************************** Função Principal ***********************************/
@@ -92,7 +84,8 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    FILE *Img = fopen(argv[1], "wb");
+    // Abrir o arquivo
+    FILE *Img = fopen(argv[1], "r+b");
     if (!Img) {
         cout << "Erro: Arquivo " << argv[1] << " não pode ser aberto!" << endl;
         exit(1);
@@ -100,7 +93,7 @@ int main(int argc, char *argv[]) {
 
     // Escreve o Boot Record no .Img
     Boot_Record boot_record = fill_BT();
-    write_boot_record(Img, boot_record);
+    write_boot_record(Img, &boot_record);
 
     cout << "Arquivo " << argv[1] << " formatado com sucesso!" << endl;
 
