@@ -51,6 +51,7 @@ typedef struct {
 } Data_Region;
 
 /*********************************** Funções ***********************************/
+/*********************************** Boot Record ***********************************/
 // Função para preecher as informações do Boot Record
 Boot_Record fill_BT() {
     Boot_Record bt;
@@ -71,10 +72,70 @@ Boot_Record fill_BT() {
     return bt;
 }
 
-// Função para preencher com zeros o restante do Boot Record
+// Função para escrever o Boot Record no .img
 void write_boot_record(FILE *img, Boot_Record *bt) {
     fseek(img, 0, SEEK_SET);
     fwrite(bt, sizeof(Boot_Record), 1, img);
+}
+
+/*********************************** Bitmap ***********************************/
+// Função para criar Bitmap com todos os setores livres
+Bitmap Fill_Bitmap(uint32_t total_sectors) {
+    Bitmap bm;
+
+    // Número total de bytes necessários
+    uint32_t total_bytes = (total_sectors + 7) / 8;
+
+    // Cria todo o bitmap inicializado com 0 (tudo livre)
+    bm.bits.assign(total_bytes, 0);
+
+    return bm;
+}
+
+// Função para marcar o setor ocupado
+void bitmap_mark(Bitmap &bm, uint32_t sector) {
+    uint32_t byte_index = sector / 8;
+    uint32_t bit_index  = sector % 8;
+
+    bm.bits[byte_index] |= (1 << bit_index);
+}
+
+// Função para preecher os setores ocupados
+Bitmap Fill_System_Bitmap(Boot_Record *bt) {
+    Bitmap bm = Fill_Bitmap(bt->total_sectors);
+
+    // Setor 0 = Boot Record
+    bitmap_mark(bm, 0);
+
+    // Setores do Bitmap
+    for (uint32_t s = bt->bitmap_start; s < bt->bitmap_start + bt->bitmap_size; s++) {
+        bitmap_mark(bm, s);
+    }
+
+    // Setores do Diretório Raiz
+    for (uint32_t s = bt->root_dir_start; s < bt->root_dir_start + bt->root_dir_size; s++) {
+        bitmap_mark(bm, s);
+    }
+
+    return bm;
+}
+
+// Função para escrever o Bitmap no .img
+void write_bitmap(FILE *img, Boot_Record *bt, Bitmap *bm) {
+    long offset = bt->bitmap_start * BYTES_PER_SECTOR;
+    fseek(img, offset, SEEK_SET);
+
+    // Escreve o conteúdo do bitmap
+    fwrite(bm->bits.data(), 1, bm->bits.size(), img);
+
+    // Preenche o restante do(s) setor(es) com zeros caso sobre espaço
+    uint32_t bytes_written = bm->bits.size();
+    uint32_t bitmap_sector_bytes = bt->bitmap_size * BYTES_PER_SECTOR;
+
+    if (bytes_written < bitmap_sector_bytes) {
+        vector<uint8_t> zeros(bitmap_sector_bytes - bytes_written, 0);
+        fwrite(zeros.data(), 1, zeros.size(), img);
+    }
 }
 
 /*********************************** Função Principal ***********************************/
@@ -91,9 +152,13 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    // Escreve o Boot Record no .Img
+    // Escreve o Boot Record no .img
     Boot_Record boot_record = fill_BT();
     write_boot_record(Img, &boot_record);
+
+    // Escreve o Bitmap no .img
+    Bitmap bitmap = Fill_System_Bitmap(&boot_record);
+    write_bitmap(Img, &boot_record, &bitmap);
 
     cout << "Arquivo " << argv[1] << " formatado com sucesso!" << endl;
 
