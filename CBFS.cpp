@@ -4,173 +4,195 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
-#include <iomanip>
 #include <algorithm>
+#include <iomanip>
 
 using namespace std;
 
-// --- Configurações do Sistema ---
+// --- Configurações ---
 const int TAM_SETOR = 512;
-const uint16_t ASSINATURA = 0xAA55;
-const int TAM_ENTRADA = 32;
-const uint32_t FIM_CADEIA = 0xFFFFFFFF;
+const uint16_t ASSINATURA_BOOT = 0x7777; 
+const string NOME_SISTEMA = "CBFS";      
 
-// Estrutura do Setor de Boot (Boot Record)
+// Estrutura do Setor de Boot 
 #pragma pack(push, 1)
 struct BootRecord {
-    uint8_t jump[3];
-    char oem_name[8];
-    uint16_t bytes_por_setor;    // Offset 0x0B
-    uint8_t setores_por_cluster; // Offset 0x0D
-    uint16_t setores_reservados; // Offset 0x0E
-    uint8_t num_bitmaps;
-    uint16_t entradas_raiz;
-    uint16_t setores_totais;
-    uint16_t tam_bitmap;         // Tamanho do Bitmap em setores
-    uint16_t tam_indice;         // Tamanho da Região de Índices em setores
-    uint16_t tam_raiz;           // Tamanho do Diretório Raiz em setores
-    uint8_t padding[460];        // Preenchimento para alinhar a assinatura
-    uint16_t assinatura;         // Offset 0x1FE (510)
+    uint16_t bytes_por_setor;       // Offset 0
+    uint16_t setores_reservados;    // Offset 2
+    uint16_t max_entradas_root;     // Offset 4
+    uint16_t tam_root_setores;      // Offset 6
+    uint32_t total_setores;         // Offset 8
+    uint32_t inicio_bitmap;         // Offset 12
+    uint32_t tam_bitmap_setores;    // Offset 16
+    uint32_t inicio_root;           // Offset 20
+    uint32_t inicio_dados;          // Offset 24
+    uint8_t  padding_gap[4];        // Offset 28-32
+    char     nome_sistema[4];       // Offset 32
+    uint16_t assinatura;            // Offset 36
+    uint8_t  padding_final[474];    // Preencher até 512 bytes
 };
 
-// Estrutura de uma entrada no Diretório Raiz
+// Estrutura da Entrada de Diretório
 struct EntradaDir {
-    char nome[8];
-    char ext[3];
-    uint8_t atributo;
-    uint8_t reservado[12];
-    uint32_t ptr_indice;         // Ponteiro para o primeiro Bloco de Índice
-    uint32_t tamanho;            // Tamanho do arquivo em bytes
+    char     nome[16];          // Offset 0
+    char     ext[3];            // Offset 16
+    uint8_t  atributo;          // Offset 19
+    uint32_t tamanho_bytes;     // Offset 20
+    uint32_t primeiro_setor;    // Offset 24
+    uint32_t num_setores;       // Offset 28
 };
 #pragma pack(pop)
+
+// Atributos
+const uint8_t ATTR_LIVRE = 0x00;
+const uint8_t ATTR_VALIDO = 0x10;
+const uint8_t ATTR_EXCLUIDO = 0x20;
+const uint8_t ATTR_MODIFICADO = 0x30;
 
 class CBFS {
     string dispositivo;
     BootRecord br;
-    long off_bitmap, off_indice, off_raiz, off_dados;
-    int tam_cluster;
 
-    // Função simples para abrir o arquivo do disco
+    // Abre o dispositivo
     fstream abrir(ios::openmode modo) {
         fstream f(dispositivo, modo | ios::binary);
         if (!f.is_open()) throw runtime_error("Erro ao abrir o dispositivo: " + dispositivo);
         return f;
     }
 
-    // Lê o setor de boot e calcula onde começa cada região do disco
+    // Lê metadados
     void carregar_metadados() {
         fstream f = abrir(ios::in);
-        f.read((char*)&br, sizeof(br));
-        if (br.assinatura != ASSINATURA) throw runtime_error("Disco nao formatado como CBFS.");
+        f.read((char*)&br, sizeof(BootRecord));
+        if (br.assinatura != ASSINATURA_BOOT) 
+            throw runtime_error("Disco nao formatado como CBFS (Assinatura invalida).");
+    }
+
+    // Auxiliar: Limpa espaços de strings
+    string limpar_string(string s) {
+        size_t last = s.find_last_not_of(' ');
+        if (last == string::npos) return "";
+        return s.substr(0, last + 1);
+    }
+
+    // Define bit no Bitmap
+    void set_bitmap(fstream &f, uint32_t setor, bool ocupado) {
+        long offset = (long)br.inicio_bitmap * TAM_SETOR + (setor / 8);
+        int bit = setor % 8;
         
-        // Cálculo dos offsets (posições) de cada área
-        off_bitmap = (long)br.setores_reservados * TAM_SETOR;
-        off_indice = off_bitmap + ((long)br.tam_bitmap * TAM_SETOR);
-        off_raiz   = off_indice + ((long)br.tam_indice * TAM_SETOR);
-        off_dados  = off_raiz   + ((long)br.tam_raiz * TAM_SETOR);
-        tam_cluster = br.bytes_por_setor * br.setores_por_cluster;
+        char byte;
+        f.seekg(offset);
+        f.read(&byte, 1);
+        
+        if (ocupado) byte |= (1 << bit);
+        else byte &= ~(1 << bit);
+        
+        f.seekp(offset);
+        f.write(&byte, 1);
     }
 
-    // Procura um bloco de índice que esteja todo zerado (vazio)
-    uint32_t buscar_bloco_indice_livre(fstream &f) {
-        vector<char> buf(tam_cluster);
-        int total_blocos = (br.tam_indice * TAM_SETOR) / tam_cluster;
-        for (int i = 0; i < total_blocos; i++) {
-            f.seekg(off_indice + (long)i * tam_cluster);
-            f.read(buf.data(), tam_cluster);
-            bool vazio = true;
-            for (char c : buf) if (c != 0) { vazio = false; break; }
-            if (vazio) return i;
-        }
-        throw runtime_error("Nao ha mais espaco na Regiao de Indices.");
-    }
-
-    // Procura um bit 0 no Bitmap para alocar um cluster de dados
-    uint32_t alocar_cluster_dados(fstream &f) {
-        f.seekg(off_bitmap);
-        vector<uint8_t> bmp(br.tam_bitmap * TAM_SETOR);
+    // Busca espaço CONTÍGUO 
+    uint32_t buscar_espaco_livre(fstream &f, uint32_t qtd_setores) {
+        vector<uint8_t> bmp(br.tam_bitmap_setores * TAM_SETOR);
+        f.seekg((long)br.inicio_bitmap * TAM_SETOR);
         f.read((char*)bmp.data(), bmp.size());
-        for (int i = 0; i < bmp.size() * 8; i++) {
-            if (!(bmp[i/8] & (1 << (i%8)))) {
-                bmp[i/8] |= (1 << (i%8)); // Marca como ocupado (1)
-                f.seekp(off_bitmap);
-                f.write((char*)bmp.data(), bmp.size());
-                return i + 2; // Clusters de dados começam em 2
+
+        uint32_t contador = 0;
+        uint32_t inicio_candidato = 0;
+
+        // Tenta achar buraco contíguo
+        for(uint32_t i = br.inicio_dados; i < br.total_setores; i++) {
+            bool ocupado = (bmp[i/8] >> (i%8)) & 1;
+            
+            if (!ocupado) {
+                if (contador == 0) inicio_candidato = i;
+                contador++;
+                if (contador == qtd_setores) return inicio_candidato;
+            } else {
+                contador = 0;
             }
         }
-        throw runtime_error("Disco cheio (Regiao de Dados).");
-    }
 
-    // Marca um bit como 0 no Bitmap para liberar o cluster
-    void liberar_cluster_dados(fstream &f, uint32_t cl) {
-        if (cl < 2) return;
-        f.seekg(off_bitmap);
-        vector<uint8_t> bmp(br.tam_bitmap * TAM_SETOR);
-        f.read((char*)bmp.data(), bmp.size());
-        bmp[(cl-2)/8] &= ~(1 << ((cl-2)%8)); // Zera o bit
-        f.seekp(off_bitmap);
-        f.write((char*)bmp.data(), bmp.size());
-    }
+        // --- Diagnóstico de Erro ---
+        uint32_t total_livres = 0;
+        for(uint32_t i = br.inicio_dados; i < br.total_setores; i++) {
+            if (!((bmp[i/8] >> (i%8)) & 1)) total_livres++;
+        }
 
-    // Função auxiliar para limpar espaços em branco de strings
-    string limpar_string(string s) {
-        s.erase(s.find_last_not_of(' ') + 1);
-        return s;
+        if (total_livres < qtd_setores) {
+            throw runtime_error("Erro: Disco cheio! Espaco livre insuficiente.");
+        } else {
+            throw runtime_error("Erro: Fragmentacao! Ha espaco livre, mas nao contiguo.");
+        }
     }
 
 public:
     CBFS(string d) : dispositivo(d) {}
 
-    // Formata o disco criando as estruturas iniciais
+    // Formatar
     void formatar(int total_setores) {
         memset(&br, 0, sizeof(br));
-        br.jump[0] = 0xEB; br.jump[1] = 0x3C; br.jump[2] = 0x90;
-        memcpy(br.oem_name, "CBFS_PTV ", 8);
         br.bytes_por_setor = TAM_SETOR;
-        br.setores_por_cluster = 1;
-        br.setores_reservados = 1;
-        br.entradas_raiz = 128;
-        br.setores_totais = total_setores;
-        br.tam_raiz = 8; 
-        br.tam_indice = ceil(total_setores * 0.05); // 5% do disco para índices
-        br.tam_bitmap = ceil(total_setores / (512.0 * 8.0));
-        br.assinatura = ASSINATURA;
+        br.setores_reservados = 1; 
+        br.max_entradas_root = 128;
+        br.tam_root_setores = 8;
+        br.total_setores = total_setores;
+        
+        br.inicio_bitmap = 1;
+        br.tam_bitmap_setores = (total_setores + 4095) / 4096;
+        if (br.tam_bitmap_setores == 0) br.tam_bitmap_setores = 1;
+        
+        br.inicio_root = br.inicio_bitmap + br.tam_bitmap_setores;
+        br.inicio_dados = br.inicio_root + br.tam_root_setores;
+        
+        strncpy(br.nome_sistema, NOME_SISTEMA.c_str(), 4);
+        br.assinatura = ASSINATURA_BOOT;
 
         ofstream f(dispositivo, ios::binary);
+        if (!f) throw runtime_error("Falha ao criar arquivo de disco.");
+        
         f.write((char*)&br, sizeof(br));
-        
-        // Zera as regiões de metadados
-        vector<char> zeros(TAM_SETOR, 0);
-        int meta_setores = br.tam_bitmap + br.tam_indice + br.tam_raiz;
-        for(int i=0; i < meta_setores; i++) f.write(zeros.data(), TAM_SETOR);
-        
-        // Garante o tamanho final do arquivo
         f.seekp((long)total_setores * TAM_SETOR - 1);
         char z = 0; f.write(&z, 1);
         f.close();
+
+        fstream fs = abrir(ios::in | ios::out);
+        vector<char> zeros(br.tam_bitmap_setores * TAM_SETOR, 0);
+        fs.seekp((long)br.inicio_bitmap * TAM_SETOR);
+        fs.write(zeros.data(), zeros.size());
+
+        for(uint32_t i=0; i < br.inicio_dados; i++) set_bitmap(fs, i, true);
+        
+        vector<char> root_z(br.tam_root_setores * TAM_SETOR, 0);
+        fs.seekp((long)br.inicio_root * TAM_SETOR);
+        fs.write(root_z.data(), root_z.size());
+
         cout << "Disco formatado com sucesso (" << total_setores << " setores)." << endl;
     }
 
-    // Lista os arquivos presentes no diretório raiz
+    // Listar
     void listar() {
         carregar_metadados();
         fstream f = abrir(ios::in);
-        f.seekg(off_raiz);
+        f.seekg((long)br.inicio_root * TAM_SETOR);
+        
         EntradaDir e;
-        cout << left << setw(15) << "NOME" << setw(12) << "TAMANHO" << "ID_INDICE" << endl;
-        cout << string(40, '-') << endl;
-        for(int i=0; i<128; i++) {
+        cout << left << setw(20) << "NOME" << setw(10) << "EXT" << setw(10) << "TAMANHO" << "LBA INICIAL" << endl;
+        cout << string(60, '-') << endl;
+        
+        for(int i=0; i < br.max_entradas_root; i++) {
             f.read((char*)&e, sizeof(e));
-            if (e.nome[0] != 0 && (uint8_t)e.nome[0] != 0xE5) {
-                string n(e.nome, 8); n = limpar_string(n);
-                string ex(e.ext, 3); ex = limpar_string(ex);
-                string nome_completo = n + (ex.empty() ? "" : "." + ex);
-                cout << left << setw(15) << nome_completo << setw(12) << e.tamanho << e.ptr_indice << endl;
+            if (e.atributo == ATTR_LIVRE) break; 
+            if (e.atributo == ATTR_VALIDO || e.atributo == ATTR_MODIFICADO) {
+                cout << left << setw(20) << limpar_string(string(e.nome, 16))
+                     << setw(10) << limpar_string(string(e.ext, 3))
+                     << setw(10) << e.tamanho_bytes 
+                     << e.primeiro_setor << endl;
             }
         }
     }
 
-    // Copia um arquivo do PC para o CBFS
+    // Importar
     void importar(string pc_origem) {
         carregar_metadados();
         ifstream arq_in(pc_origem, ios::binary | ios::ate);
@@ -178,177 +200,187 @@ public:
         uint32_t tam = arq_in.tellg();
         arq_in.seekg(0);
 
+        uint32_t setores_nec = (tam + TAM_SETOR - 1) / TAM_SETOR;
+        if (setores_nec == 0) setores_nec = 1;
+
         fstream f = abrir(ios::in | ios::out);
+
+        // Preparar nome do arquivo novo
+        string base = pc_origem.substr(pc_origem.find_last_of("/\\") + 1);
+        size_t ponto = base.find_last_of('.');
+        string n_novo = (ponto == string::npos) ? base : base.substr(0, ponto);
+        string ex_novo = (ponto == string::npos) ? "" : base.substr(ponto + 1);
         
-        // 1. Achar vaga no diretório
-        f.seekg(off_raiz);
-        EntradaDir e;
+        transform(n_novo.begin(), n_novo.end(), n_novo.begin(), ::toupper);
+        transform(ex_novo.begin(), ex_novo.end(), ex_novo.begin(), ::toupper);
+        string nome_completo_novo = n_novo + (ex_novo.empty() ? "" : "." + ex_novo);
+
+        // --- Proteção contra arquivos duplicados ---
+        f.seekg((long)br.inicio_root * TAM_SETOR);
+        EntradaDir e_temp;
         int idx_vaga = -1;
-        for(int i=0; i<128; i++) {
-            f.read((char*)&e, sizeof(e));
-            if (e.nome[0] == 0 || (uint8_t)e.nome[0] == 0xE5) { idx_vaga = i; break; }
+        
+        for(int i=0; i < br.max_entradas_root; i++) {
+            f.read((char*)&e_temp, sizeof(e_temp));
+            
+            // Verifica há arquivos duplicados se o arquivo for válido
+            if (e_temp.atributo == ATTR_VALIDO || e_temp.atributo == ATTR_MODIFICADO) {
+                string n_existente = limpar_string(string(e_temp.nome, 16));
+                string ex_existente = limpar_string(string(e_temp.ext, 3));
+                string existente = n_existente + (ex_existente.empty() ? "" : "." + ex_existente);
+                
+                if (existente == nome_completo_novo) {
+                    throw runtime_error("Erro: Ja existe um arquivo com este nome ('" + nome_completo_novo + "').");
+                }
+            }
+
+            // Guarda a primeira vaga livre encontrada
+            if (idx_vaga == -1 && (e_temp.atributo == ATTR_LIVRE || e_temp.atributo == ATTR_EXCLUIDO)) {
+                idx_vaga = i;
+            }
         }
         if (idx_vaga == -1) throw runtime_error("Diretorio Raiz cheio.");
 
-        // 2. Alocar blocos e copiar dados
-        uint32_t bloco_idx = buscar_bloco_indice_livre(f);
-        uint32_t primeiro_bloco = bloco_idx;
-        uint32_t escritos = 0;
-        int slot = 0, max_slots = (tam_cluster/4)-1;
-        vector<char> buffer(tam_cluster);
+        // Busca Espaço
+        uint32_t setor_inicial = buscar_espaco_livre(f, setores_nec);
 
-        while(escritos < tam) {
-            uint32_t cl_dado = alocar_cluster_dados(f);
-            int ler = min((uint32_t)tam_cluster, tam - escritos);
-            arq_in.read(buffer.data(), ler);
+        // Copiar dados
+        vector<char> buffer(TAM_SETOR);
+        for(uint32_t i=0; i < setores_nec; i++) {
+            memset(buffer.data(), 0, TAM_SETOR);
+            if (arq_in.tellg() < tam) arq_in.read(buffer.data(), TAM_SETOR);
             
-            // Escreve o dado
-            f.seekp(off_dados + (long)(cl_dado - 2) * tam_cluster);
-            f.write(buffer.data(), tam_cluster);
-
-            // Registra no índice
-            f.seekp(off_indice + (long)bloco_idx * tam_cluster + (slot * 4));
-            f.write((char*)&cl_dado, 4);
-            
-            escritos += ler; slot++;
-            
-            // Se o bloco de índice encher, aloca outro
-            if (slot == max_slots && escritos < tam) {
-                uint32_t novo = buscar_bloco_indice_livre(f);
-                f.seekp(off_indice + (long)bloco_idx * tam_cluster + (max_slots * 4));
-                f.write((char*)&novo, 4);
-                bloco_idx = novo; slot = 0;
-            }
+            f.seekp((long)(setor_inicial + i) * TAM_SETOR);
+            f.write(buffer.data(), TAM_SETOR);
+            set_bitmap(f, setor_inicial + i, true);
         }
-        // Marca o fim da cadeia de índices
-        uint32_t fim = FIM_CADEIA;
-        f.seekp(off_indice + (long)bloco_idx * tam_cluster + (slot * 4)); f.write((char*)&fim, 4);
 
-        // 3. Gravar entrada no diretório
+        // Gravar no Diretório
+        EntradaDir e;
         memset(&e, 0, sizeof(e));
-        memset(e.nome, ' ', 8); memset(e.ext, ' ', 3);
+        memset(e.nome, ' ', 16); memcpy(e.nome, n_novo.c_str(), min((size_t)16, n_novo.size()));
+        memset(e.ext, ' ', 3);   memcpy(e.ext, ex_novo.c_str(), min((size_t)3, ex_novo.size()));
         
-        // Extrai apenas o nome do arquivo (sem o caminho)
-        string base = pc_origem.substr(pc_origem.find_last_of("/\\") + 1);
-        size_t ponto = base.find_last_of('.');
-        string n = (ponto == string::npos) ? base : base.substr(0, ponto);
-        string ex = (ponto == string::npos) ? "" : base.substr(ponto + 1);
-        
-        memcpy(e.nome, n.c_str(), min((int)n.size(), 8));
-        memcpy(e.ext, ex.c_str(), min((int)ex.size(), 3));
-        e.ptr_indice = primeiro_bloco;
-        e.tamanho = tam;
-        
-        f.seekp(off_raiz + idx_vaga * TAM_ENTRADA);
+        e.atributo = ATTR_VALIDO;
+        e.tamanho_bytes = tam;
+        e.primeiro_setor = setor_inicial;
+        e.num_setores = setores_nec;
+
+        f.seekp((long)br.inicio_root * TAM_SETOR + (idx_vaga * sizeof(EntradaDir)));
         f.write((char*)&e, sizeof(e));
-        cout << "Arquivo '" << base << "' importado com sucesso." << endl;
+
+        cout << "Arquivo importado com sucesso (Setor " << setor_inicial << ")." << endl;
     }
 
-    // Copia um arquivo do CBFS para o PC
+    // Exportar
     void exportar(string nome_cbfs) {
         carregar_metadados();
-        
-        // Converte busca para maiúsculo para facilitar
         string busca = nome_cbfs;
         transform(busca.begin(), busca.end(), busca.begin(), ::toupper);
 
         fstream f = abrir(ios::in);
-        f.seekg(off_raiz);
+        f.seekg((long)br.inicio_root * TAM_SETOR);
         EntradaDir e;
-        bool achou = false;
-        for(int i=0; i<128; i++) {
+        
+        for(int i=0; i < br.max_entradas_root; i++) {
             f.read((char*)&e, sizeof(e));
-            if (e.nome[0] != 0 && (uint8_t)e.nome[0] != 0xE5) {
-                string n(e.nome, 8); n = limpar_string(n);
-                string ex(e.ext, 3); ex = limpar_string(ex);
-                string completo = n + (ex.empty() ? "" : "." + ex);
+            if (e.atributo != ATTR_VALIDO && e.atributo != ATTR_MODIFICADO) continue;
+
+            string n = limpar_string(string(e.nome, 16));
+            string ex = limpar_string(string(e.ext, 3));
+            string completo = n + (ex.empty() ? "" : "." + ex);
+
+            if (completo == busca) {
+                ofstream arq_out(nome_cbfs, ios::binary);
+                f.seekg((long)e.primeiro_setor * TAM_SETOR);
                 
-                string n_upper = completo;
-                transform(n_upper.begin(), n_upper.end(), n_upper.begin(), ::toupper);
-                
-                if (n_upper == busca) { achou = true; break; }
+                vector<char> buf(TAM_SETOR);
+                uint32_t resta = e.tamanho_bytes;
+                for(uint32_t s=0; s < e.num_setores; s++) {
+                    f.read(buf.data(), TAM_SETOR);
+                    uint32_t write_sz = (resta > TAM_SETOR) ? TAM_SETOR : resta;
+                    arq_out.write(buf.data(), write_sz);
+                    resta -= write_sz;
+                }
+                cout << "Arquivo exportado com sucesso!" << endl;
+                return;
             }
         }
-        if (!achou) throw runtime_error("Arquivo nao encontrado no CBFS.");
-
-        ofstream arq_out(nome_cbfs, ios::binary); // Copia o arquivo para o diretório atual
-        uint32_t bloco_idx = e.ptr_indice;
-        uint32_t restante = e.tamanho;
-        vector<char> buffer(tam_cluster);
-
-        while(bloco_idx != FIM_CADEIA && restante > 0) {
-            for(int s=0; s<(tam_cluster/4)-1 && restante > 0; s++) {
-                uint32_t cl_dado;
-                f.seekg(off_indice + (long)bloco_idx * tam_cluster + (s*4));
-                f.read((char*)&cl_dado, 4);
-                
-                f.seekg(off_dados + (long)(cl_dado - 2) * tam_cluster);
-                int a_ler = min((uint32_t)tam_cluster, restante);
-                f.read(buffer.data(), a_ler);
-                arq_out.write(buffer.data(), a_ler);
-                restante -= a_ler;
-            }
-            // Pula para o próximo bloco de índice (último slot)
-            f.seekg(off_indice + (long)bloco_idx * tam_cluster + (tam_cluster - 4));
-            f.read((char*)&bloco_idx, 4);
-        }
-        cout << "Arquivo exportado com sucesso para o diretório atual!" << endl;
+        throw runtime_error("Arquivo nao encontrado no CBFS.");
     }
 
-    // Remove um arquivo do sistema
+    // Remover
     void remover(string nome) {
         carregar_metadados();
-        
         string busca = nome;
         transform(busca.begin(), busca.end(), busca.begin(), ::toupper);
 
         fstream f = abrir(ios::in | ios::out);
-        f.seekg(off_raiz);
+        f.seekg((long)br.inicio_root * TAM_SETOR);
         EntradaDir e;
-        long pos_entrada;
-        for(int i=0; i<128; i++) {
-            pos_entrada = f.tellg();
-            f.read((char*)&e, sizeof(e));
-            if (e.nome[0] == 0 || (uint8_t)e.nome[0] == 0xE5) continue;
+        long pos_leitura;
 
-            string n(e.nome, 8); n = limpar_string(n);
-            string ex(e.ext, 3); ex = limpar_string(ex);
+        for(int i=0; i < br.max_entradas_root; i++) {
+            pos_leitura = f.tellg();
+            f.read((char*)&e, sizeof(e));
+            if (e.atributo != ATTR_VALIDO && e.atributo != ATTR_MODIFICADO) continue;
+
+            string n = limpar_string(string(e.nome, 16));
+            string ex = limpar_string(string(e.ext, 3));
             string completo = n + (ex.empty() ? "" : "." + ex);
 
-            string n_upper = completo;
-            transform(n_upper.begin(), n_upper.end(), n_upper.begin(), ::toupper);
-
-            if (n_upper == busca) {
-                uint32_t b_idx = e.ptr_indice;
-                while(b_idx != FIM_CADEIA && b_idx != 0) {
-                    // 1. Lê o próximo índice ANTES de zerar o atual
-                    uint32_t prox;
-                    f.seekg(off_indice + (long)b_idx * tam_cluster + (tam_cluster - 4));
-                    f.read((char*)&prox, 4);
-
-                    // 2. Libera os clusters de dados apontados por este bloco
-                    for(int s=0; s<(tam_cluster/4)-1; s++) {
-                        uint32_t cl;
-                        f.seekg(off_indice + (long)b_idx * tam_cluster + (s*4));
-                        f.read((char*)&cl, 4);
-                        if (cl >= 2 && cl != FIM_CADEIA) liberar_cluster_dados(f, cl);
-                    }
-                    
-                    // 3. Zera o bloco de índice atual no disco
-                    vector<char> zeros(tam_cluster, 0);
-                    f.seekp(off_indice + (long)b_idx * tam_cluster);
-                    f.write(zeros.data(), tam_cluster);
-                    
-                    // 4. Avança para o próximo bloco da cadeia
-                    b_idx = prox;
+            if (completo == busca) {
+                // Marca excluído
+                f.seekp(pos_leitura + 19); 
+                f.write((char*)&ATTR_EXCLUIDO, 1);
+                
+                // Libera Bitmap
+                for(uint32_t s=0; s < e.num_setores; s++) {
+                    set_bitmap(f, e.primeiro_setor + s, false);
                 }
-                // Marca a entrada como excluída no diretório
-                f.seekp(pos_entrada); char mark = 0xE5; f.write(&mark, 1);
-                cout << "Arquivo '" << nome << "' removido com sucesso." << endl;
+                cout << "Arquivo removido com sucesso." << endl;
                 return;
             }
         }
         throw runtime_error("Arquivo nao encontrado para remocao.");
+    }
+
+    // --- Status do Disco (Visualização) ---
+    void status() {
+        carregar_metadados();
+        fstream f = abrir(ios::in);
+        
+        vector<uint8_t> bmp(br.tam_bitmap_setores * TAM_SETOR);
+        f.seekg((long)br.inicio_bitmap * TAM_SETOR);
+        f.read((char*)bmp.data(), bmp.size());
+
+        uint32_t ocupados = 0;
+        uint32_t livres = 0;
+        
+        cout << endl << "--- MAPA DO DISCO (Visualizacao Simplificada) ---" << endl;
+        cout << "[.] Livre  [#] Ocupado (Sistema/Arquivos)" << endl;
+        cout << "------------------------------------------------" << endl;
+
+        // Escala para não encher a tela se o disco for muito grande
+        int escala = max(1, (int)br.total_setores / 64); 
+        
+        for (uint32_t i = 0; i < br.total_setores; i++) {
+            bool is_ocupado = (bmp[i/8] >> (i%8)) & 1;
+            
+            if (is_ocupado) ocupados++;
+            else livres++;
+
+            // Imprime 1 caractere a cada 'escala' setores
+            if (i % escala == 0) {
+                cout << (is_ocupado ? "#" : ".");
+            }
+        }
+        cout << endl << string(48, '-') << endl;
+        cout << "Setores Totais: " << br.total_setores << endl;
+        cout << "Setores Usados: " << ocupados << " (" << (ocupados*100/br.total_setores) << "%)" << endl;
+        cout << "Setores Livres: " << livres << endl;
+        cout << "Capacidade:     " << (br.total_setores * TAM_SETOR) / 1024 << " KB" << endl;
+        cout << endl;
     }
 };
 
@@ -360,6 +392,7 @@ int main(int argc, char* argv[]) {
         cout << "./cbfs importar <disco> <arquivo_pc>" << endl;
         cout << "./cbfs exportar <disco> <nome_do_aqruivo_no_cbfs>" << endl;
         cout << "./cbfs remover  <disco> <nome_do_aqruivo_no_cbfs>" << endl;
+        cout << "./cbfs status   <disco>" << endl; 
         return 1;
     }
     try {
@@ -370,6 +403,7 @@ int main(int argc, char* argv[]) {
         else if (cmd == "importar") fs.importar(argv[3]);
         else if (cmd == "exportar") fs.exportar(argv[3]);
         else if (cmd == "remover") fs.remover(argv[3]);
+        else if (cmd == "status") fs.status(); 
         else cout << "Comando invalido!" << endl;
     } catch(exception &ex) {
         cerr << "Erro: " << ex.what() << endl;
