@@ -245,7 +245,7 @@ public:
     }
 
     // Copia um arquivo do CBFS para o PC
-    void exportar(string nome_cbfs, string pc_destino) {
+    void exportar(string nome_cbfs) {
         carregar_metadados();
         
         // Converte busca para maiúsculo para facilitar
@@ -271,7 +271,7 @@ public:
         }
         if (!achou) throw runtime_error("Arquivo nao encontrado no CBFS.");
 
-        ofstream arq_out(pc_destino, ios::binary);
+        ofstream arq_out(nome_cbfs, ios::binary); // Copia o arquivo para o diretório atual
         uint32_t bloco_idx = e.ptr_indice;
         uint32_t restante = e.tamanho;
         vector<char> buffer(tam_cluster);
@@ -292,7 +292,7 @@ public:
             f.seekg(off_indice + (long)bloco_idx * tam_cluster + (tam_cluster - 4));
             f.read((char*)&bloco_idx, 4);
         }
-        cout << "Arquivo exportado com sucesso para: " << pc_destino << endl;
+        cout << "Arquivo exportado com sucesso para o diretório atual!" << endl;
     }
 
     // Remove um arquivo do sistema
@@ -358,8 +358,8 @@ int main(int argc, char* argv[]) {
         cout << "./cbfs formatar <disco> <setores>" << endl;
         cout << "./cbfs listar   <disco>" << endl;
         cout << "./cbfs importar <disco> <arquivo_pc>" << endl;
-        cout << "./cbfs exportar <disco> <nome_cbfs> <destino_pc>" << endl;
-        cout << "./cbfs remover  <disco> <nome_cbfs>" << endl;
+        cout << "./cbfs exportar <disco> <nome_do_aqruivo_no_cbfs>" << endl;
+        cout << "./cbfs remover  <disco> <nome_do_aqruivo_no_cbfs>" << endl;
         return 1;
     }
     try {
@@ -368,7 +368,7 @@ int main(int argc, char* argv[]) {
         if (cmd == "formatar") fs.formatar(stoi(argv[3]));
         else if (cmd == "listar") fs.listar();
         else if (cmd == "importar") fs.importar(argv[3]);
-        else if (cmd == "exportar") fs.exportar(argv[3], argv[4]);
+        else if (cmd == "exportar") fs.exportar(argv[3]);
         else if (cmd == "remover") fs.remover(argv[3]);
         else cout << "Comando invalido!" << endl;
     } catch(exception &ex) {
