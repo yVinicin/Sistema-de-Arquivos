@@ -390,8 +390,8 @@ int main(int argc, char* argv[]) {
         cout << "./cbfs formatar <disco> <setores>" << endl;
         cout << "./cbfs listar   <disco>" << endl;
         cout << "./cbfs importar <disco> <arquivo_pc>" << endl;
-        cout << "./cbfs exportar <disco> <nome_do_aqruivo_no_cbfs>" << endl;
-        cout << "./cbfs remover  <disco> <nome_do_aqruivo_no_cbfs>" << endl;
+        cout << "./cbfs exportar <disco> <nome_do_arquivo_no_cbfs>" << endl;
+        cout << "./cbfs remover  <disco> <nome_do_arquivo_no_cbfs>" << endl;
         cout << "./cbfs status   <disco>" << endl; 
         return 1;
     }
